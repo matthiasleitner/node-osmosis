@@ -1,9 +1,10 @@
 'use strict';
 
-var Command = require('./lib/Command.js'),
-    Queue   = require('./lib/Queue.js'),
-    request = require('./lib/Request.js'),
-    libxml  = require('libxmljs-dom'),
+var Command     = require('./lib/Command.js'),
+    request     = require('./lib/Request.js'),
+    libxml      = require('libxmljs-dom'),
+    RateLimiter = require('limiter').RateLimiter,
+
     instanceId      = 0,
     memoryUsage     = 0,
     cachedSelectors = {},
@@ -59,8 +60,9 @@ function Osmosis(url, params) {
     }
 
     this.queue   = new Queue(this);
-    this.command = new Command(this);
-    this.id      = ++instanceId;
+    this.command  = new Command(this);
+    this.id       = ++instanceId;
+    this.throttle = new RateLimiter(999, 1, true);
 }
 
 
@@ -177,54 +179,59 @@ Osmosis.prototype.request = function (url, opts, callback, tries) {
         params = url.params;
 
     this.requests++;
+
     this.queue.requests++;
     this.queue.push();
 
-    request(url.method,
-            url,
-            url.params,
-            opts,
-            tries,
-            function (err, res, data) {
-                var proxies = opts.proxies;
+    this.throttle.removeTokens(1, function(err, remainingRequests) {
+        request(url.method,
+                url,
+                url.params,
+                opts,
+                tries,
+                function (err, res, data) {
+                    var proxies = opts.proxies;
 
-                self.queue.requests--;
+                    self.stack.requests--;
 
-                if ((res === undefined || res.statusCode !== 404) &&
-                    proxies !== undefined) {
-                    self.command.error('proxy ' + (proxies.index + 1) +
-                                        '/' + proxies.length +
-                                        ' failed (' + opts.proxy + ')');
+                    if ((res === undefined || res.statusCode !== 404) &&
+                        proxies !== undefined) {
+                        self.command.error('proxy ' + (proxies.index + 1) +
+                                            '/' + proxies.length +
+                                            ' failed (' + opts.proxy + ')');
 
-                    // remove the failing proxy
-                    if (proxies.length > 1) {
-                        opts.proxies.splice(proxies.index, 1);
-                        opts.proxy = proxies[proxies.index];
+                        // remove the failing proxy
+                        if (proxies.length > 1) {
+                            opts.proxies.splice(proxies.index, 1);
+                            opts.proxy = proxies[proxies.index];
+                        }
                     }
-                }
 
-                if (err !== null && ++tries < opts.tries) {
-                    self.queueRequest(url, opts, callback, tries);
+                    if (err !== null && tries < opts.tries) {
+                        self.queueRequest(url, opts, callback, tries + 1);
 
+                        if (self.opts.log === true) {
+                            self.command.error(err + ', retrying ' +
+                                            url.href + ' (' +
+                                            (tries + 1) + '/' +
+                                            opts.tries + ')');
+                        }
+                    } else {
+                        callback(err, res, data);
+                    }
+
+                    self.dequeueRequest();
+                    self.queue.pop();
+                })
+                .on('redirect', function (new_url) {
                     if (self.opts.log === true) {
-                        self.command.error(err + ', retrying ' +
-                                        url.href + ' (' +
-                                        (tries + 1) + '/' +
-                                        opts.tries + ')');
+                        self.command.log('[redirect] ' +
+                                         url.href + ' -> ' + new_url);
                     }
-                } else {
-                    callback(err, res, data);
-                }
 
-                self.dequeueRequest();
-                self.queue.pop();
-            })
-            .on('redirect', function (new_url) {
-                if (self.opts.log === true) {
-                    self.command.log('[redirect] ' +
-                                     href + ' -> ' + new_url);
-                }
+                url.href = new_url;
             });
+    });
 };
 
 /**
@@ -320,6 +327,8 @@ Osmosis.prototype.resources = function () {
 
                 'requests: ' + this.requests +
                              ' (' + this.queue.requests + ' queued), ' +
+
+                'tokens: ' + parseInt(this.throttle.getTokensRemaining()) + ', ' +
 
                 'RAM: '      + toMB(mem.rss) + ' (' + memDiff + '), ' +
 
